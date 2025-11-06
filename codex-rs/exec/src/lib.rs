@@ -42,10 +42,88 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 use crate::cli::Command as ExecCommand;
+use crate::cli::ReviewCommand;
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use codex_core::default_client::set_default_originator;
 use codex_core::find_conversation_path_by_id_str;
+use codex_core::protocol::ReviewRequest;
+use codex_core::review_format::format_review_findings_block;
+
+fn read_prompt_from_arg_or_stdin(arg: Option<String>) -> anyhow::Result<String> {
+    match arg {
+        Some(p) if p != "-" => Ok(p),
+        maybe_dash => {
+            let force_stdin = matches!(maybe_dash.as_deref(), Some("-"));
+            if std::io::stdin().is_terminal() && !force_stdin {
+                anyhow::bail!(
+                    "No prompt provided. Either specify one as an argument or pipe the prompt into stdin."
+                );
+            }
+            if !force_stdin {
+                eprintln!("Reading prompt from stdin...");
+            }
+            let mut buffer = String::new();
+            std::io::stdin().read_to_string(&mut buffer)
+                .map_err(|e| anyhow::anyhow!("Failed to read prompt from stdin: {e}"))?;
+            if buffer.trim().is_empty() {
+                anyhow::bail!("No prompt provided via stdin.");
+            }
+            Ok(buffer)
+        }
+    }
+}
+
+fn build_review_request(cmd: &ReviewCommand) -> anyhow::Result<ReviewRequest> {
+    match cmd {
+        ReviewCommand::Uncommitted => Ok(ReviewRequest {
+            prompt: "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.".to_string(),
+            user_facing_hint: "current changes".to_string(),
+        }),
+        ReviewCommand::BaseBranch { branch } => {
+            if branch.trim().is_empty() {
+                anyhow::bail!("Branch name cannot be empty");
+            }
+            Ok(ReviewRequest {
+                prompt: format!(
+                    "Review the code changes against the base branch '{branch}'. Start by finding the merge diff between the current branch and {branch}'s upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"{branch}@{{upstream}}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the {branch} branch. Provide prioritized, actionable findings."
+                ),
+                user_facing_hint: format!("changes against '{branch}'"),
+            })
+        }
+        ReviewCommand::Commit { sha, subject } => {
+            if sha.trim().is_empty() {
+                anyhow::bail!("Commit SHA cannot be empty");
+            }
+            let short = sha.chars().take(7).collect::<String>();
+            let hint = format!("commit {short}");
+            let prompt = if let Some(subject) = subject.as_deref() {
+                format!(
+                    "Review the code changes introduced by commit {sha} (\"{subject}\"). Provide prioritized, actionable findings."
+                )
+            } else {
+                format!(
+                    "Review the code changes introduced by commit {sha}. Provide prioritized, actionable findings."
+                )
+            };
+            Ok(ReviewRequest {
+                prompt,
+                user_facing_hint: hint,
+            })
+        }
+        ReviewCommand::Custom { prompt } => {
+            let prompt = read_prompt_from_arg_or_stdin(prompt.clone())?;
+            let trimmed = prompt.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("Custom review prompt cannot be empty");
+            }
+            Ok(ReviewRequest {
+                prompt: trimmed.to_string(),
+                user_facing_hint: trimmed.to_string(),
+            })
+        }
+    }
+}
 
 pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
     if let Err(err) = set_default_originator("codex_exec".to_string()) {
@@ -71,46 +149,59 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         config_overrides,
     } = cli;
 
+    let is_review_mode = matches!(command, Some(ExecCommand::Review { .. }));
+
     // Determine the prompt source (parent or subcommand) and read from stdin if needed.
     let prompt_arg = match &command {
         // Allow prompt before the subcommand by falling back to the parent-level prompt
         // when the Resume subcommand did not provide its own prompt.
         Some(ExecCommand::Resume(args)) => args.prompt.clone().or(prompt),
+        Some(ExecCommand::Review { .. }) => None,
         None => prompt,
     };
 
-    let prompt = match prompt_arg {
-        Some(p) if p != "-" => p,
-        // Either `-` was passed or no positional arg.
-        maybe_dash => {
-            // When no arg (None) **and** stdin is a TTY, bail out early – unless the
-            // user explicitly forced reading via `-`.
-            let force_stdin = matches!(maybe_dash.as_deref(), Some("-"));
-
-            if std::io::stdin().is_terminal() && !force_stdin {
-                eprintln!(
-                    "No prompt provided. Either specify one as an argument or pipe the prompt into stdin."
-                );
-                std::process::exit(1);
-            }
-
-            // Ensure the user knows we are waiting on stdin, as they may
-            // have gotten into this state by mistake. If so, and they are not
-            // writing to stdin, Codex will hang indefinitely, so this should
-            // help them debug in that case.
-            if !force_stdin {
-                eprintln!("Reading prompt from stdin...");
-            }
-            let mut buffer = String::new();
-            if let Err(e) = std::io::stdin().read_to_string(&mut buffer) {
-                eprintln!("Failed to read prompt from stdin: {e}");
-                std::process::exit(1);
-            } else if buffer.trim().is_empty() {
-                eprintln!("No prompt provided via stdin.");
-                std::process::exit(1);
-            }
-            buffer
+    let (prompt, review_request) = if is_review_mode {
+        if let Some(ExecCommand::Review { command: ref review_command }) = command {
+            let review_request = build_review_request(review_command)?;
+            (String::new(), Some(review_request))
+        } else {
+            (String::new(), None)
         }
+    } else {
+        let prompt = match prompt_arg {
+            Some(p) if p != "-" => p,
+            // Either `-` was passed or no positional arg.
+            maybe_dash => {
+                // When no arg (None) **and** stdin is a TTY, bail out early – unless the
+                // user explicitly forced reading via `-`.
+                let force_stdin = matches!(maybe_dash.as_deref(), Some("-"));
+
+                if std::io::stdin().is_terminal() && !force_stdin {
+                    eprintln!(
+                        "No prompt provided. Either specify one as an argument or pipe the prompt into stdin."
+                    );
+                    std::process::exit(1);
+                }
+
+                // Ensure the user knows we are waiting on stdin, as they may
+                // have gotten into this state by mistake. If so, and they are not
+                // writing to stdin, Codex will hang indefinitely, so this should
+                // help them debug in that case.
+                if !force_stdin {
+                    eprintln!("Reading prompt from stdin...");
+                }
+                let mut buffer = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut buffer) {
+                    eprintln!("Failed to read prompt from stdin: {e}");
+                    std::process::exit(1);
+                } else if buffer.trim().is_empty() {
+                    eprintln!("No prompt provided via stdin.");
+                    std::process::exit(1);
+                }
+                buffer
+            }
+        };
+        (prompt, None)
     };
 
     let output_schema = load_output_schema(output_schema_path);
@@ -261,8 +352,8 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         conversation_id: _,
         conversation,
         session_configured,
-    } = if let Some(ExecCommand::Resume(args)) = command {
-        let resume_path = resolve_resume_path(&config, &args).await?;
+    } = if let Some(ExecCommand::Resume(ref args)) = command {
+        let resume_path = resolve_resume_path(&config, args).await?;
 
         if let Some(path) = resume_path {
             conversation_manager
@@ -280,7 +371,8 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     };
     // Print the effective configuration and prompt so users can see what Codex
     // is using.
-    event_processor.print_config_summary(&config, &prompt, &session_configured);
+    let display_prompt = review_request.as_ref().map(|r| r.user_facing_hint.as_str()).unwrap_or(&prompt);
+    event_processor.print_config_summary(&config, display_prompt, &session_configured);
 
     info!("Codex initialized with event: {session_configured:?}");
 
@@ -323,34 +415,83 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         });
     }
 
-    // Package images and prompt into a single user input turn.
-    let mut items: Vec<UserInput> = images
-        .into_iter()
-        .map(|path| UserInput::LocalImage { path })
-        .collect();
-    items.push(UserInput::Text { text: prompt });
-    let initial_prompt_task_id = conversation
-        .submit(Op::UserTurn {
-            items,
-            cwd: default_cwd,
-            approval_policy: default_approval_policy,
-            sandbox_policy: default_sandbox_policy,
-            model: default_model,
-            effort: default_effort,
-            summary: default_summary,
-            final_output_json_schema: output_schema,
-        })
-        .await?;
-    info!("Sent prompt with event ID: {initial_prompt_task_id}");
+    let _initial_prompt_task_id = if let Some(review_request) = review_request {
+        let task_id = conversation.submit(Op::Review { review_request }).await?;
+        info!("Sent review request with event ID: {task_id}");
+        task_id
+    } else {
+        // Package images and prompt into a single user input turn.
+        let mut items: Vec<UserInput> = images
+            .into_iter()
+            .map(|path| UserInput::LocalImage { path })
+            .collect();
+        items.push(UserInput::Text { text: prompt });
+        let task_id = conversation
+            .submit(Op::UserTurn {
+                items,
+                cwd: default_cwd,
+                approval_policy: default_approval_policy,
+                sandbox_policy: default_sandbox_policy,
+                model: default_model,
+                effort: default_effort,
+                summary: default_summary,
+                final_output_json_schema: output_schema,
+            })
+            .await?;
+        info!("Sent prompt with event ID: {task_id}");
+        task_id
+    };
 
     // Run the loop until the task is complete.
     // Track whether a fatal error was reported by the server so we can
     // exit with a non-zero status for automation-friendly signaling.
     let mut error_seen = false;
+    let mut review_output_seen = false;
+
     while let Some(event) = rx.recv().await {
         if matches!(event.msg, EventMsg::Error(_)) {
             error_seen = true;
         }
+
+        // Special handling for review mode output
+        if is_review_mode {
+            #[allow(clippy::print_stdout)]
+            if let EventMsg::ExitedReviewMode(ref ev) = event.msg {
+                if let Some(ref out) = ev.review_output {
+                    review_output_seen = true;
+                    if json_mode {
+                        let s = serde_json::to_string(&out).unwrap_or_else(|e| {
+                            format!("{{\"error\": \"Failed to serialize review output: {}\"}}", e)
+                        });
+                        println!("{s}");
+                    } else {
+                        let text = out.overall_explanation.trim();
+                        if !text.is_empty() {
+                            if text.ends_with('\n') {
+                                print!("{text}");
+                            } else {
+                                println!("{text}");
+                            }
+                        }
+                        if !out.findings.is_empty() {
+                            let block = format_review_findings_block(&out.findings, None);
+                            if block.ends_with('\n') {
+                                print!("{block}");
+                            } else {
+                                println!("{block}");
+                            }
+                        }
+                    }
+                } else {
+                    if json_mode {
+                        println!("{{\"error\": \"Review interrupted with no structured result.\"}}");
+                    } else {
+                        println!("Review interrupted with no structured result.");
+                    }
+                }
+            }
+        }
+
         let shutdown: CodexStatus = event_processor.process_event(event);
         match shutdown {
             CodexStatus::Running => continue,
@@ -363,6 +504,10 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         }
     }
     event_processor.print_final_output();
+
+    if is_review_mode && !review_output_seen {
+        std::process::exit(1);
+    }
     if error_seen {
         std::process::exit(1);
     }

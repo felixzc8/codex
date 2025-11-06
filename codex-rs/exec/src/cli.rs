@@ -81,6 +81,28 @@ pub struct Cli {
 pub enum Command {
     /// Resume a previous session by id or pick the most recent with --last.
     Resume(ResumeArgs),
+    /// Run headless code review with presets.
+    #[clap(visible_alias = "r")]
+    Review {
+        #[command(subcommand)]
+        command: ReviewCommand,
+    },
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum ReviewCommand {
+    /// Review uncommitted changes (staged, unstaged, and untracked).
+    Uncommitted,
+    /// Review a specific commit by SHA. Optionally provide a subject line to improve results.
+    Commit {
+        sha: String,
+        #[arg(long = "subject")]
+        subject: Option<String>,
+    },
+    /// Review changes against a base branch.
+    BaseBranch { branch: String },
+    /// Review with custom instructions. If PROMPT is '-' or omitted, read from stdin.
+    Custom { prompt: Option<String> },
 }
 
 #[derive(Parser, Debug)]
