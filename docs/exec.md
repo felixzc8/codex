@@ -112,3 +112,40 @@ CODEX_API_KEY=your-api-key-here codex exec "Fix merge conflict"
 ```
 
 NOTE: `CODEX_API_KEY` is only supported in `codex exec`.
+
+## Code review presets
+
+Use `codex exec review` to run headless code review with the same presets as the TUI. This is useful for CI, pre‑commit hooks, or terminal‑only workflows.
+
+- Presets (alias: `r`):
+  - `uncommitted` – review staged, unstaged, and untracked changes
+  - `base-branch <branch>` – review changes to be merged into a base branch
+  - `commit <sha> [--subject <subject>]` – review a specific commit
+  - `custom [PROMPT|-]` – custom instructions (read from stdin when `-` or omitted)
+
+Examples
+
+```shell
+# Uncommitted changes
+codex exec review uncommitted
+
+# Against a base branch
+codex exec review base-branch main
+
+# Specific commit (with optional subject for better results)
+codex exec review commit d5853d9 --subject "Fix sandbox command assessment"
+
+# Custom instructions (arg or stdin)
+codex exec review custom "Check for security vulnerabilities"
+echo "Check for security vulnerabilities" | codex exec review custom -
+```
+
+Output behavior
+
+- Non‑JSON: Codex prints only the review content (overall explanation and formatted findings) to stdout. A concise start/finish banner is written to stderr.
+- JSON (`--json`): events stream as JSONL to stdout; on completion, a structured review object is emitted (compatible with automation).
+
+Notes
+
+- Review mode runs in the current working directory (or the directory specified with `-C/--cd`) and requires a Git repository unless `--skip-git-repo-check` is used.
+- The base‑branch preset instructs Codex to compute the merge base and diff against the upstream of the given branch.
