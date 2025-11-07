@@ -64,7 +64,8 @@ fn read_prompt_from_arg_or_stdin(arg: Option<String>) -> anyhow::Result<String> 
                 eprintln!("Reading prompt from stdin...");
             }
             let mut buffer = String::new();
-            std::io::stdin().read_to_string(&mut buffer)
+            std::io::stdin()
+                .read_to_string(&mut buffer)
                 .map_err(|e| anyhow::anyhow!("Failed to read prompt from stdin: {e}"))?;
             if buffer.trim().is_empty() {
                 anyhow::bail!("No prompt provided via stdin.");
@@ -161,7 +162,10 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     };
 
     let (prompt, review_request) = if is_review_mode {
-        if let Some(ExecCommand::Review { command: ref review_command }) = command {
+        if let Some(ExecCommand::Review {
+            command: ref review_command,
+        }) = command
+        {
             let review_request = build_review_request(review_command)?;
             (String::new(), Some(review_request))
         } else {
@@ -371,7 +375,10 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     };
     // Print the effective configuration and prompt so users can see what Codex
     // is using.
-    let display_prompt = review_request.as_ref().map(|r| r.user_facing_hint.as_str()).unwrap_or(&prompt);
+    let display_prompt = review_request
+        .as_ref()
+        .map(|r| r.user_facing_hint.as_str())
+        .unwrap_or(&prompt);
     event_processor.print_config_summary(&config, display_prompt, &session_configured);
 
     info!("Codex initialized with event: {session_configured:?}");
@@ -456,39 +463,52 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         // Special handling for review mode output
         if is_review_mode {
             #[allow(clippy::print_stdout)]
-            if let EventMsg::ExitedReviewMode(ref ev) = event.msg {
-                if let Some(ref out) = ev.review_output {
-                    review_output_seen = true;
-                    if json_mode {
-                        let s = serde_json::to_string(&out).unwrap_or_else(|e| {
-                            format!("{{\"error\": \"Failed to serialize review output: {}\"}}", e)
-                        });
-                        println!("{s}");
-                    } else {
-                        let text = out.overall_explanation.trim();
-                        if !text.is_empty() {
-                            if text.ends_with('\n') {
-                                print!("{text}");
-                            } else {
-                                println!("{text}");
-                            }
-                        }
-                        if !out.findings.is_empty() {
-                            let block = format_review_findings_block(&out.findings, None);
-                            if block.ends_with('\n') {
-                                print!("{block}");
-                            } else {
-                                println!("{block}");
-                            }
-                        }
-                    }
+            if let EventMsg::EnteredReviewMode(ref req) = event.msg {
+                eprintln!(">> Code review started: {} <<", req.user_facing_hint);
+            } else if let EventMsg::ExitedReviewMode(ref ev) = event.msg {
+                if review_output_seen {
                 } else {
-                    if json_mode {
-                        println!("{{\"error\": \"Review interrupted with no structured result.\"}}");
+                    if let Some(ref out) = ev.review_output {
+                        review_output_seen = true;
+                        if json_mode {
+                            let s = serde_json::to_string(&out).unwrap_or_else(|e| {
+                                format!(
+                                    "{{\"error\": \"Failed to serialize review output: {}\"}}",
+                                    e
+                                )
+                            });
+                            println!("{s}");
+                        } else {
+                            let text = out.overall_explanation.trim();
+                            if !text.is_empty() {
+                                if text.ends_with('\n') {
+                                    print!("{text}");
+                                } else {
+                                    println!("{text}");
+                                }
+                            }
+                            if !out.findings.is_empty() {
+                                let block = format_review_findings_block(&out.findings, None);
+                                if block.ends_with('\n') {
+                                    print!("{block}");
+                                } else {
+                                    println!("{block}");
+                                }
+                            }
+                            eprintln!("<< Code review finished >>");
+                        }
                     } else {
-                        println!("Review interrupted with no structured result.");
+                        if !json_mode {
+                            eprintln!("<< Code review finished >>");
+                        }
                     }
                 }
+            }
+        }
+
+        if is_review_mode && review_output_seen {
+            if matches!(event.msg, EventMsg::TurnAborted(_)) {
+                continue;
             }
         }
 
