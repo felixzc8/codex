@@ -13,6 +13,7 @@ Looking for something specific? Jump ahead:
 | `codex`            | Interactive TUI                    | `codex`                         |
 | `codex "..."`      | Initial prompt for interactive TUI | `codex "fix lint errors"`       |
 | `codex exec "..."` | Non-interactive "automation mode"  | `codex exec "explain utils.ts"` |
+| `codex exec review …` | Headless code review presets        | `codex exec review uncommitted`  |
 
 Key flags: `--model/-m`, `--ask-for-approval/-a`.
 
