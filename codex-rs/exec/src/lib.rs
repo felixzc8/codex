@@ -317,12 +317,17 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         let _ = tracing_subscriber::registry().with(fmt_layer).try_init();
     }
 
+    let ep_last_message_path = if is_review_mode {
+        None
+    } else {
+        last_message_file.clone()
+    };
     let mut event_processor: Box<dyn EventProcessor> = match json_mode {
-        true => Box::new(EventProcessorWithJsonOutput::new(last_message_file.clone())),
+        true => Box::new(EventProcessorWithJsonOutput::new(ep_last_message_path)),
         _ => Box::new(EventProcessorWithHumanOutput::create_with_ansi(
             stdout_with_ansi,
             &config,
-            last_message_file.clone(),
+            ep_last_message_path,
         )),
     };
 
@@ -466,8 +471,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             if let EventMsg::EnteredReviewMode(ref req) = event.msg {
                 eprintln!(">> Code review started: {} <<", req.user_facing_hint);
             } else if let EventMsg::ExitedReviewMode(ref ev) = event.msg {
-                if review_output_seen {
-                } else {
+                if !review_output_seen {
                     if let Some(ref out) = ev.review_output {
                         review_output_seen = true;
                         if json_mode {
@@ -478,29 +482,51 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                                 )
                             });
                             println!("{s}");
+                            if let Some(path) = last_message_file.as_deref() {
+                                if let Err(err) = std::fs::write(path, &s) {
+                                    eprintln!(
+                                        "Failed to write last message file {}: {err}",
+                                        path.display()
+                                    );
+                                }
+                            }
                         } else {
+                            let mut rendered = String::new();
+
                             let text = out.overall_explanation.trim();
                             if !text.is_empty() {
-                                if text.ends_with('\n') {
-                                    print!("{text}");
-                                } else {
-                                    println!("{text}");
+                                rendered.push_str(text);
+                                if !text.ends_with('\n') {
+                                    rendered.push('\n');
                                 }
                             }
                             if !out.findings.is_empty() {
                                 let block = format_review_findings_block(&out.findings, None);
-                                if block.ends_with('\n') {
-                                    print!("{block}");
-                                } else {
-                                    println!("{block}");
+                                rendered.push_str(&block);
+                                if !block.ends_with('\n') {
+                                    rendered.push('\n');
                                 }
                             }
+
+                            #[allow(clippy::print_stdout)]
+                            {
+                                print!("{rendered}");
+                            }
+
+                            // Mirror to output file if requested.
+                            if let Some(path) = last_message_file.as_deref() {
+                                if let Err(err) = std::fs::write(path, &rendered) {
+                                    eprintln!(
+                                        "Failed to write last message file {}: {err}",
+                                        path.display()
+                                    );
+                                }
+                            }
+
                             eprintln!("<< Code review finished >>");
                         }
-                    } else {
-                        if !json_mode {
-                            eprintln!("<< Code review finished >>");
-                        }
+                    } else if !json_mode {
+                        eprintln!("<< Code review finished >>");
                     }
                 }
             }
